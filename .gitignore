@@ -1,0 +1,25 @@
+# 大数据/备份/报告(绝不入库)
+algo_limit_tests/
+releases/
+reports/
+__pycache__/
+*.pyc
+# 模型/engine(体积大,本地或 trtexec 重建)
+*.trt
+*.onnx
+*.engine
+# 录像/视频/数据产物
+*.avi
+*.mp4
+*.mkv
+*.log
+*.csv
+# 测试数据:只保留小 ref 图,排除大视频/其他
+testdata/*
+!testdata/refs_tele_real/
+testdata/refs_tele_real/*
+!testdata/refs_tele_real/*.jpg
+# 合成数据产物:只保留脚本
+synth_bench/out*/
+synth_bench/cv_vs_trt/
+synth_bench/trackers/
