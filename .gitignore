@@ -19,6 +19,9 @@ testdata/*
 !testdata/refs_tele_real/
 testdata/refs_tele_real/*
 !testdata/refs_tele_real/*.jpg
+!testdata/refs_field_0610/
+testdata/refs_field_0610/*
+!testdata/refs_field_0610/*.jpg
 # 合成数据产物:只保留脚本
 synth_bench/out*/
 synth_bench/cv_vs_trt/
