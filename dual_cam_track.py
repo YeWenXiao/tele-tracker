@@ -28,6 +28,71 @@ class TrackPipeline:
         self.locked = False; self.low_cnt = 0; self.drift = 0; self.fi = 0
         self.sift_exec = ThreadPoolExecutor(max_workers=1)   # SIFT 异步,不阻塞主循环
         self.sift_future = None; self.sift_frame = None
+        # ref 尺度阶梯:目标接近变大时,异步预切换到尺度匹配的 ref(找回/验证无缝)
+        self.ref_sizes = [max(r[1][0], r[1][1]) for r in self.sift.refs]   # 每张 ref 的最大边
+        self.ladder_future = None
+        self.ladder_ratio = 1.4    # 目标尺寸/当前ref尺寸 偏离超此倍数 → 触发预匹配
+
+    def _ladder_match(self, frame, bbox, idx):
+        """在 bbox 周边小区域,用指定 ref 单张匹配(便宜,几 ms 级)。命中返回 True。"""
+        x, y, w, h = bbox
+        cx, cy = x + w / 2, y + h / 2
+        rw, rh = w * 2.5, h * 2.5
+        x0 = int(max(0, cx - rw / 2)); y0 = int(max(0, cy - rh / 2))
+        x1 = int(min(self.W, cx + rw / 2)); y1 = int(min(self.H, cy + rh / 2))
+        crop = frame[y0:y1, x0:x1]
+        if crop.size == 0:
+            return False
+        kf, df = self.sift.sift.detectAndCompute(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), None)
+        if df is None:
+            return False
+        name, shape, kp, des = self.sift.refs[idx]
+        good = [p[0] for p in self.sift.bf.knnMatch(des, df, k=2)
+                if len(p) == 2 and p[0].distance < 0.75 * p[1].distance]
+        if len(good) < 4:
+            return False
+        src = np.float32([kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([kf[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        Hm, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+        if Hm is None:
+            return False
+        pts = dst.reshape(-1, 2)[mask.ravel() == 1]
+        uniq = len(np.unique(np.round(pts), axis=0))
+        det = abs(np.linalg.det(Hm[:2, :2]))
+        if uniq < 10 or det < 0.02 or det > 30:
+            return False
+        csim = color_similarity(crop, self.sift.ref_imgs[idx])
+        return csim >= 0.20   # 区域含少量背景,门槛略放
+
+    def _ladder_check(self, frame):
+        """TRACK 态周期跑:目标尺寸偏离当前 ref 太多 → 异步用尺度最近的 ref 预匹配,命中静默切换。"""
+        if self.ladder_future is not None:
+            if self.ladder_future.done():
+                try:
+                    hit, idx = self.ladder_future.result()
+                except Exception:
+                    hit, idx = False, -1
+                self.ladder_future = None
+                if hit:
+                    old = self.sift.refs[self.sift.last_idx][0]
+                    self.sift.last_idx = idx
+                    print(f"[REF-LADDER] {old} → {self.sift.refs[idx][0]} (目标尺度变化,预切换)")
+            return
+        if self.fi % 15 != 0 or self.sift.last_idx is None or self.bbox is None:
+            return
+        cur_size = max(self.bbox[2], self.bbox[3])
+        cur_ref = self.ref_sizes[self.sift.last_idx]
+        r = cur_size / max(cur_ref, 1)
+        if 1 / self.ladder_ratio < r < self.ladder_ratio:
+            return                                # 尺度还匹配,不动
+        # 选尺度最接近当前目标的 ref(非当前)
+        best = min(range(len(self.ref_sizes)),
+                   key=lambda i: abs(np.log(self.ref_sizes[i] / max(cur_size, 1))))
+        if best == self.sift.last_idx:
+            return
+        bbox = self.bbox
+        self.ladder_future = self.sift_exec.submit(
+            lambda: (self._ladder_match(frame, bbox, best), best))
 
     def step(self, frame):
         self.fi += 1
@@ -81,6 +146,7 @@ class TrackPipeline:
                     self.state = 'SEARCH'; self.locked = False; self.drift = 0
             if self.locked:
                 self.bbox = (x, y, w, h); self.low_cnt = 0
+                self._ladder_check(frame)   # 尺度阶梯:目标变大/变小时异步预切换 ref(无缝)
             else:
                 self.low_cnt += 1
                 if self.low_cnt >= self.relost:
