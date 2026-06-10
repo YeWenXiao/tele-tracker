@@ -61,8 +61,10 @@ class TrackPipeline:
         det = abs(np.linalg.det(Hm[:2, :2]))
         if uniq < 10 or det < 0.02 or det > 30:
             return False
-        csim = color_similarity(crop, self.sift.ref_imgs[idx])
-        return csim >= 0.20   # 区域含少量背景,门槛略放
+        # 颜色比 bbox 本身(箱子),不能比 2.5x 搜索区域(大半是背景,sim 被稀释)
+        bx_ = frame[max(0, y):max(0, y) + max(1, h), max(0, x):max(0, x) + max(1, w)]
+        csim = color_similarity(bx_, self.sift.ref_imgs[idx])
+        return csim >= 0.20
 
     def _ladder_check(self, frame):
         """TRACK 态周期跑:目标尺寸偏离当前 ref 太多 → 异步用尺度最近的 ref 预匹配,命中静默切换。"""
