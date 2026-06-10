@@ -89,26 +89,36 @@ def build_world(box_size=0.5, box_pos=(0.0, 6.0)):
 # ── 渲染 ─────────────────────────────────────────────
 _GROUND_TEX = None
 _G_PXM = 60        # 地面纹理 px/米
-_G_X0, _G_Z0 = -20.0, -4.0   # 纹理左上对应的世界坐标(覆盖 x:-20~20, z:-4~36)
+_G_X0, _G_Z0 = -40.0, -40.0   # 纹理左上对应的世界坐标(覆盖 x:-40~40, z:-40~40)
 
 
-def _ground_quad(cam_pos):
-    """地面 = 锚定世界的无限平面,每帧取相机前方可见区段(角点永不落到身后)"""
+def _draw_ground(frame, C, R, yaw, focal, W, H):
+    """地面特殊渲染:可见区段跟随相机朝向构造(角点永在前方,任意 yaw 不消失);
+    纹理坐标由世界坐标直接映射,大纹理一次 warp 上屏。"""
     global _GROUND_TEX
     if _GROUND_TEX is None:
-        _GROUND_TEX = tex_ground(_G_PXM, 40)
-    cx, _, cz = cam_pos
-    x0, x1 = cx - 18, cx + 18
-    z0, z1 = cz + 0.4, min(cz + 26, 35.5)
-    # 世界矩形 → 纹理子图
-    tx0 = int((x0 - _G_X0) * _G_PXM); tx1 = int((x1 - _G_X0) * _G_PXM)
-    tz0 = int((z0 - _G_Z0) * _G_PXM); tz1 = int((z1 - _G_Z0) * _G_PXM)
+        _GROUND_TEX = tex_ground(_G_PXM, 80)
+    cy_, sy_ = np.cos(yaw), np.sin(yaw)
+    ax = np.float32([cy_, 0, -sy_])      # 相机 x 轴(世界系)
+    az = np.float32([sy_, 0, cy_])       # 相机 z 轴(世界系)
+    base = np.float32([C[0], 0, C[2]])
+    corners = []
+    for dx, dz in [(-34, 36), (34, 36), (34, 0.3), (-34, 0.3)]:   # 相机系矩形
+        p = base + ax * dx + az * dz
+        corners.append(p)
+    corners = np.float32(corners)
+    pc = (corners - C) @ R.T
+    u = focal * pc[:, 0] / pc[:, 2] + W / 2
+    v = -focal * pc[:, 1] / pc[:, 2] + H / 2
+    dst = np.float32(list(zip(u, v)))
     n = _GROUND_TEX.shape[0]
-    tx0, tx1 = max(0, tx0), min(n, tx1)
-    tz0, tz1 = max(0, tz0), min(n, tz1)
-    sub = _GROUND_TEX[tz0:tz1, tx0:tx1]
-    corners = [(x0, 0, z1), (x1, 0, z1), (x1, 0, z0), (x0, 0, z0)]   # 远边在上
-    return Quad(corners, sub[::-1].copy(), double=True)              # 纹理 z 方向翻转对齐
+    tex_pts = np.float32([[np.clip((p[0] - _G_X0) * _G_PXM, 0, n - 1),
+                           np.clip((p[2] - _G_Z0) * _G_PXM, 0, n - 1)] for p in corners])
+    M = cv2.getPerspectiveTransform(tex_pts, dst)
+    warped = cv2.warpPerspective(_GROUND_TEX, M, (W, H), flags=cv2.INTER_LINEAR)
+    mask = cv2.warpPerspective(np.full((n, n), 255, np.uint8), M, (W, H))
+    mask[:H // 2 + 1] = 0     # 地面只存在于地平线以下(裁掉平面单应的镜像翻折)
+    frame[mask > 0] = warped[mask > 0]
 
 
 def render_view(quads, cam_pos, yaw, focal, W, H, sky=(60, 55, 50)):
@@ -117,7 +127,7 @@ def render_view(quads, cam_pos, yaw, focal, W, H, sky=(60, 55, 50)):
     cy_, sy_ = np.cos(yaw), np.sin(yaw)
     R = np.float32([[cy_, 0, -sy_], [0, 1, 0], [sy_, 0, cy_]])     # world→cam
     frame = np.full((H, W, 3), sky, np.uint8)
-    quads = [_ground_quad(cam_pos)] + list(quads)    # 地面最先画(最远层)
+    _draw_ground(frame, C, R, yaw, focal, W, H)      # 地面最先画(最远层)
 
     def project(pts):
         pc = (pts - C) @ R.T
@@ -155,23 +165,23 @@ def main():
     vw = cv2.VideoWriter(OUT, cv2.VideoWriter_fourcc(*'MJPG'), 30, (W, H))
 
     def path(n):
-        """前 → 后 → 左 → 右 → 环视。返回 (pos, yaw, 段名)"""
-        if n < 150:                                  # 前进 z 0→4
-            return (0, 0.8, 4 * n / 149), 0.0, 'FORWARD'
-        if n < 270:                                  # 后退 4→0
-            return (0, 0.8, 4 * (1 - (n - 150) / 119)), 0.0, 'BACKWARD'
-        if n < 390:                                  # 左移 x 0→-3
-            return (-3 * (n - 270) / 119, 0.8, 0), 0.0, 'STRAFE LEFT'
-        if n < 510:                                  # 右移 -3→+3
-            return (-3 + 6 * (n - 390) / 119, 0.8, 0), 0.0, 'STRAFE RIGHT'
-        if n < 600:                                  # 回中 +3→0 顺带轻微转头
-            t = (n - 510) / 89
-            return (3 * (1 - t), 0.8, 0), 0.25 * np.sin(t * np.pi), 'PAN'
-        return (0, 0.8, 0), 0.0, "END"
+        """前 → 后 → 左 → 右 → 环视。返回 (pos, yaw, 段名)。起步 -5m(距箱 11m 远视距)"""
+        if n < 180:                                  # 前进 z -5→4(距箱 11m→2m)
+            return (0, 0.8, -5 + 9 * n / 179), 0.0, 'FORWARD'
+        if n < 300:                                  # 后退 4→-5
+            return (0, 0.8, 4 - 9 * (n - 180) / 119), 0.0, 'BACKWARD'
+        if n < 420:                                  # 左移 x 0→-3(在 -2m 处,距箱 8m)
+            return (-3 * (n - 300) / 119, 0.8, -2), 0.0, 'STRAFE LEFT'
+        if n < 540:                                  # 右移 -3→+3
+            return (-3 + 6 * (n - 420) / 119, 0.8, -2), 0.0, 'STRAFE RIGHT'
+        if n < 630:                                  # 回中 +3→0 顺带轻微转头
+            t = (n - 540) / 89
+            return (3 * (1 - t), 0.8, -2), 0.25 * np.sin(t * np.pi), 'PAN'
+        return (0, 0.8, -2), 0.0, "END"
 
     import time
     t0 = time.time()
-    for n in range(600):
+    for n in range(630):
         pos, yaw, label = path(n)
         f = render_view(quads, pos, yaw, focal, W, H)
         cv2.putText(f, f"{label}  cam=({pos[0]:+.1f},{pos[2]:+.1f})m yaw={yaw:+.2f}", (15, 35),
@@ -179,7 +189,7 @@ def main():
         cv2.putText(f, f"f{n}", (15, H - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         vw.write(f)
     vw.release()
-    print(f"600 帧 {time.time()-t0:.0f}s → {OUT}")
+    print(f"630 帧 {time.time()-t0:.0f}s → {OUT}")
 
 
 if __name__ == '__main__':
