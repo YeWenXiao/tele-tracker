@@ -165,11 +165,11 @@ def main():
     vw = cv2.VideoWriter(OUT, cv2.VideoWriter_fourcc(*'MJPG'), 30, (W, H))
 
     def path(n):
-        """前 → 后 → 左 → 右 → 环视。返回 (pos, yaw, 段名)。起步 -5m(距箱 11m 远视距)"""
-        if n < 180:                                  # 前进 z -5→4(距箱 11m→2m)
-            return (0, 0.8, -5 + 9 * n / 179), 0.0, 'FORWARD'
-        if n < 300:                                  # 后退 4→-5
-            return (0, 0.8, 4 - 9 * (n - 180) / 119), 0.0, 'BACKWARD'
+        """前 → 后 → 左 → 右 → 环视。返回 (pos, yaw, 段名)。起步 -14m(距箱 20m 远视距)"""
+        if n < 180:                                  # 前进 z -14→4(距箱 20m→2m)
+            return (0, 0.8, -14 + 18 * n / 179), 0.0, 'FORWARD'
+        if n < 300:                                  # 后退 4→-14
+            return (0, 0.8, 4 - 18 * (n - 180) / 119), 0.0, 'BACKWARD'
         if n < 420:                                  # 左移 x 0→-3(在 -2m 处,距箱 8m)
             return (-3 * (n - 300) / 119, 0.8, -2), 0.0, 'STRAFE LEFT'
         if n < 540:                                  # 右移 -3→+3
