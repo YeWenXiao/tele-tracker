@@ -4,20 +4,21 @@ Step 1: 双摄取帧 + 长焦主追踪(SIFT异步找+ViT跟+防护链) + 广角�
         视野框=固定几何(两摄物理固定),--fov-ratio/center-x/y 标定;不依赖识别目标。
 坐标系: 广角画面 左→右 x:-1→1, 上→下 y:1→-1, 中心(0,0)。Step 2 再加失锁指引。
 """
-import os, sys, time, argparse, threading
+import os, sys, time, argparse, threading, queue, csv
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import cv2
 # 复用 pure_siamese 的组件(有 __main__ guard,import 安全)
-from pure_siamese_track import Cam, make_tracker, SiftRef, color_similarity
+from pure_siamese_track import Cam, make_tracker, SiftRef, color_similarity, save_sift_lock
 
 
 class TrackPipeline:
     """单摄追踪管线:SIFT 找(双门槛+颜色) → ViT 跟(score迟滞+颜色检查+max-box)。长焦/广角各一个。"""
     def __init__(self, name, ref_dir, W, H, sift_scale=0.3, min_inliers=30,
                  color_min=0.25, score_min=0.6, score_low=0.5, color_track_min=0.15,
-                 max_box_ratio=0.5, relost=45):
+                 max_box_ratio=0.5, relost=45, lock_dir=None):
         self.name = name
+        self.lock_dir = lock_dir   # 锁定对比图目录(ref vs 实锁 crop,远距测试诊断用)
         self.sift = SiftRef(ref_dir, min_inliers=min_inliers, scale=sift_scale)
         self.tracker = make_tracker('vit-trt')
         self.W, self.H = W, H
@@ -48,8 +49,14 @@ class TrackPipeline:
                     w = max(1, min(w, self.W - x)); h = max(1, min(h, self.H - y))
                     if w >= 20 and h >= 20 and self.sift.last_idx is not None:
                         crop = sf[y:y + h, x:x + w]
-                        csim = color_similarity(crop, self.sift.ref_imgs[self.sift.last_idx])
-                        if csim >= self.color_min:
+                        ref_img = self.sift.ref_imgs[self.sift.last_idx]
+                        ref_name = self.sift.refs[self.sift.last_idx][0]
+                        csim = color_similarity(crop, ref_img)
+                        ok_lock = csim >= self.color_min
+                        if self.lock_dir:
+                            save_sift_lock(self.lock_dir, self.fi, ref_img, crop.copy(),
+                                           inl, ref_name, csim, accepted=ok_lock)
+                        if ok_lock:
                             self.tracker.init(sf, (x, y, w, h))   # 用 SIFT 处理的那帧 init
                             self.bbox = (x, y, w, h); self.state = 'TRACK'
                             self.locked = True; self.low_cnt = 0; self.drift = 0
@@ -131,7 +138,16 @@ def main():
     ap.add_argument('--fov-ratio', type=float, default=0.33, help='长焦视野占广角的比例(焦距比;调到黄框=长焦实际内容)')
     ap.add_argument('--center-x', type=float, default=0.0, help='长焦光轴在广角水平偏移 [-1,1]')
     ap.add_argument('--center-y', type=float, default=0.0, help='长焦光轴在广角垂直偏移 [-1,1] 上正')
+    # 远目标调参(目标远=小=特征少,锁不上时调这些)
+    ap.add_argument('--tele-sift-scale', type=float, default=0.3, help='长焦 SIFT 缩放;远目标小→调大 0.5 保留特征')
+    ap.add_argument('--tele-min-inliers', type=int, default=30, help='长焦 inliers 门槛;远目标特征少→可降 20')
+    ap.add_argument('--color-min', type=float, default=0.25, help='锁定颜色门槛;户外光差异大误拒时→降 0.15')
+    ap.add_argument('--out-dir', default='', help='数据落盘目录(默认 algo_limit_tests/dual_cam_时间戳)')
     args = ap.parse_args()
+
+    out_dir = args.out_dir or f"algo_limit_tests/dual_cam_{time.strftime('%Y%m%d_%H%M%S')}"
+    lock_dir = os.path.join(out_dir, 'sift_locks')
+    os.makedirs(lock_dir, exist_ok=True)
 
     # 双摄并行启动(nvargus 每个 3-5s,串行=6-10s,并行省一半)
     _cams = {}
@@ -142,11 +158,33 @@ def main():
     for th in ths: th.start()
     for th in ths: th.join()
     tele_cam, wide_cam = _cams['tele'], _cams['wide']
-    tele = TrackPipeline('TELE', args.tele_ref, args.width, args.height)
+    tele = TrackPipeline('TELE', args.tele_ref, args.width, args.height,
+                         sift_scale=args.tele_sift_scale, min_inliers=args.tele_min_inliers,
+                         color_min=args.color_min, lock_dir=lock_dir)
     # 广角找目标(长焦丢时画橡皮筋用);广角箱子小 → scale 大保留特征 + inliers 低
     wide = TrackPipeline('WIDE', args.wide_ref, args.width, args.height, sift_scale=0.5, min_inliers=18)
     # 长焦视野框 = 实时配准(matchTemplate 找长焦画面在广角的位置),fov-ratio 给模板缩放(焦距比)
     fovloc = FovLocator(args.fov_ratio, args.width, args.height)
+
+    # 异步录像(MJPG+AVI 流式,SIGKILL 不丢) + 逐帧 CSV
+    rec_q = queue.Queue(maxsize=3)
+    _wr = [None]
+    def rec_loop():
+        while True:
+            item = rec_q.get()
+            if item is None:
+                break
+            if _wr[0] is None:
+                hh, ww = item.shape[:2]
+                _wr[0] = cv2.VideoWriter(os.path.join(out_dir, 'replay.avi'),
+                                         cv2.VideoWriter_fourcc(*'MJPG'), 30, (ww, hh))
+            _wr[0].write(item)
+    threading.Thread(target=rec_loop, daemon=True).start()
+    csv_f = open(os.path.join(out_dir, 'track.csv'), 'w', newline='')
+    cw = csv.writer(csv_f)
+    cw.writerow(['frame', 'ms', 't_state', 't_score', 't_x', 't_y', 't_w', 't_h',
+                 'w_state', 'w_locked', 'fov_bx', 'fov_by', 'fov_conf'])
+    print(f"[OUT] {out_dir}/ (replay.avi + track.csv + sift_locks/)")
 
     cv2.namedWindow("DualCam", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("DualCam", 1280, 720)
@@ -189,16 +227,30 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 3)
         # ── 左右并排(广角 | 长焦,同样大)──
         combo = np.hstack([left, right])
-        cv2.putText(combo, f"{fps_now:.0f}fps  fov={args.fov_ratio} cx={args.center_x} cy={args.center_y}",
+        cv2.putText(combo, f"f{cnt} {fps_now:.0f}fps  fov={args.fov_ratio}",
                     (20, args.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
-        cv2.imshow("DualCam", cv2.resize(combo, (args.width, args.height // 2)))
+        out = cv2.resize(combo, (args.width, args.height // 2))
+        # 数据落盘:CSV 逐帧 + 异步录像(队列满丢帧不阻塞)
+        tb = t_bbox if (t_locked and t_bbox) else (-1, -1, -1, -1)
+        cw.writerow([cnt, f'{(time.perf_counter()) * 1000:.0f}', t_state, f'{t_score:.3f}',
+                     tb[0], tb[1], tb[2], tb[3], w_state, int(w_locked), bx, by, f'{mconf:.2f}'])
+        try:
+            rec_q.put_nowait(out)
+        except queue.Full:
+            pass
+        cv2.imshow("DualCam", out)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
         cnt += 1
         if cnt % 20 == 0:
             now = time.perf_counter(); fps_now = 20 / (now - t0); t0 = now
 
+    rec_q.put(None); time.sleep(0.5)
+    if _wr[0] is not None:
+        _wr[0].release()
+    csv_f.close()
     tele_cam.close(); wide_cam.close(); cv2.destroyAllWindows()
+    print(f"[OUT] 数据已落盘: {out_dir}/")
 
 
 if __name__ == '__main__':
