@@ -186,11 +186,25 @@ class SiftRef:
             H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
             if H is None:
                 continue
-            inl = int(mask.sum())
+            inl_pts_all = dst.reshape(-1, 2)[mask.ravel() == 1]
+            # inliers 按 unique 帧点计数:远距下"多 ref 点匹配同一帧点"会伪造高 inliers
+            #(实测 22 inliers 挤在 4 个点上),unique 才是真匹配数
+            inl = len(np.unique(np.round(inl_pts_all), axis=0))
+            det = abs(np.linalg.det(H[:2, :2]))
+            if det < 0.02 or det > 30:     # 退化 H(实测假匹配 det~1e-3)
+                continue
             if inl >= self.min_inliers:
                 self.last_idx = i
                 # 框收紧:用 inlier 匹配点的实际范围(不用 ref 四角投影,避免半物体外推把背景框进来)
                 pts = dst.reshape(-1, 2)[mask.ravel() == 1]
+                # 远目标修复:中位数+MAD 聚类踢离群点 —— 真匹配密集在目标上,
+                # 零散误匹配(远处干扰物/平面背景巧合过 RANSAC)会把 min/max 框撑到半个场景
+                med = np.median(pts, axis=0)
+                dev = np.abs(pts - med).max(axis=1)            # 每点到中位中心的切比雪夫距离
+                mad = max(np.median(dev), 1.0)
+                core = pts[dev <= 5.0 * mad]                   # 5×MAD 内 = 目标上的密集簇
+                if len(core) >= max(4, len(pts) // 2):         # 簇要占一半以上才可信
+                    pts = core
                 x0, y0 = pts.min(0); x1, y1 = pts.max(0)
                 pw, ph = x1 - x0, y1 - y0
                 pad = 0.08   # 补偿边缘特征缺失(GOOD LUCK 的红边几乎无特征点)
