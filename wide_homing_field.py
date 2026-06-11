@@ -81,7 +81,9 @@ def analyze(frame, idx):
             m2 = match_ref(fkp, fdes, refs[idx + 1])
             if m2 is not None:
                 c2 = occupancy(m2[0], refs[idx + 1])
-                r['next_ok'] = 0.10 <= c2 <= 0.60
+                # 实拍照片间距不等比,下一张占比可能已 >0.6(0611 实测全程卡死的根因)
+                # 只要可信匹配 + 占比合理即可;若下一张也 >0.5 会在后续帧继续级联,正确
+                r['next_ok'] = 0.05 <= c2 <= 1.05
                 r['next_cov'] = c2
     return r
 
