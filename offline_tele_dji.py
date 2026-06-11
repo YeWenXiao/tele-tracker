@@ -38,7 +38,7 @@ def match(fkp, fdes, t):
     return Hm, uniq
 
 cap = cv2.VideoCapture('uploads/0611_dji/tele.MP4')
-vw = cv2.VideoWriter(os.path.join(OUT, 'replay.avi'), cv2.VideoWriter_fourcc(*'MJPG'), 30, (960, 540))
+vw = cv2.VideoWriter(os.path.join(OUT, 'replay.avi'), cv2.VideoWriter_fourcc(*'MJPG'), 60, (960, 540))  # 源 60fps,逐帧写必须 60
 n = 0; analyzed = 0
 hits = {t['name']: 0 for t in targets}
 first = {t['name']: -1 for t in targets}

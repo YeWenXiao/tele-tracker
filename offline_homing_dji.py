@@ -56,7 +56,7 @@ def occupancy(Hm, ref):
 
 cap = cv2.VideoCapture(args.video)
 vw = cv2.VideoWriter(os.path.join(OUT, 'replay.avi'),
-                     cv2.VideoWriter_fourcc(*'MJPG'), 30, (960, 540))
+                     cv2.VideoWriter_fourcc(*'MJPG'), 60, (960, 540))  # 源 60fps,逐帧写必须 60
 idx = 0; cnt = 0; n = 0
 last = dict(occ=-1.0, uniq=0, aim=None)
 events = []; match_ok = 0; analyzed = 0
