@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """wide_homing_field.py — 广角场景归航 现场版。
 参考图 = 沿途整张照片序列(默认 uploads/20260610/1..10.jpg,远→近,零裁剪)。
-当前画面 vs 整图匹配 → 覆盖率 <50% 连续确认 + 下一张验证 → 切换,持续逼近。
+当前画面 vs 整图匹配 → 参考图占画面 >50%(快到路标)+ 下一张验证 → 切换,持续逼近。
 输出: 实时 OSD(瞄准点+覆盖率) + replay.avi + switches/ 对比图 + homing.csv。"""
 import cv2, numpy as np, os, time, argparse, queue, threading, csv
 from concurrent.futures import ThreadPoolExecutor
@@ -56,13 +56,13 @@ def match_ref(fkp, fdes, ref):
     return Hm, uniq
 
 
-def coverage(Hm, ref):
-    Hinv = np.linalg.inv(Hm)
-    corners = np.float32([[0, 0], [W, 0], [W, H], [0, H]]).reshape(-1, 1, 2)
-    foot = cv2.perspectiveTransform(corners, Hinv).reshape(-1, 2)
-    rect = np.float32([[0, 0], [ref['w'], 0], [ref['w'], ref['h']], [0, ref['h']]])
+def occupancy(Hm, ref):
+    """参考图占当前画面的面积比例(>50% = 快走到这张路标 → 切下一张更近的)"""
+    corners = np.float32([[0, 0], [ref['w'], 0], [ref['w'], ref['h']], [0, ref['h']]]).reshape(-1, 1, 2)
+    foot = cv2.perspectiveTransform(corners, Hm).reshape(-1, 2)
+    rect = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
     area, _ = cv2.intersectConvexConvex(foot.astype(np.float32), rect)
-    return area / (ref['w'] * ref['h'])
+    return area / (W * H)
 
 
 def analyze(frame, idx):
@@ -72,15 +72,16 @@ def analyze(frame, idx):
     m = match_ref(fkp, fdes, refs[idx])
     if m is not None:
         Hm, uniq = m
-        r['cov'] = coverage(Hm, refs[idx]); r['uniq'] = uniq
+        r['cov'] = occupancy(Hm, refs[idx]); r['uniq'] = uniq
         c = cv2.perspectiveTransform(
             np.float32([[[refs[idx]['w'] / 2, refs[idx]['h'] / 2]]]), Hm).reshape(2)
         r['aim'] = (int(c[0]), int(c[1]))
-        if r['cov'] < args.cov_switch and idx < len(refs) - 1:
+        # 你的规则: 参考图占画面 >50% → 验证并切下一张更近的路标
+        if r['cov'] > args.cov_switch and idx < len(refs) - 1:
             m2 = match_ref(fkp, fdes, refs[idx + 1])
             if m2 is not None:
-                c2 = coverage(m2[0], refs[idx + 1])
-                r['next_ok'] = 0.45 <= c2 <= 1.1
+                c2 = occupancy(m2[0], refs[idx + 1])
+                r['next_ok'] = 0.10 <= c2 <= 0.60
                 r['next_cov'] = c2
     return r
 
@@ -120,9 +121,9 @@ while True:
             last = None
         fut = None
         if last and last['idx'] == idx:
-            if 0 <= last['cov'] < args.cov_switch:
-                low_cnt += 1
-            elif last['cov'] >= args.cov_switch:
+            if last['cov'] > args.cov_switch:
+                low_cnt += 1          # 占比超 50%,累计确认
+            elif last['cov'] >= 0:
                 low_cnt = 0
             if low_cnt >= 3 and last['next_ok'] and idx < len(refs) - 1:
                 idx += 1; low_cnt = 0
@@ -141,7 +142,7 @@ while True:
         col = (0, 255, 0) if cov >= 0 else (0, 0, 255)
         if last['aim'] and 0 <= last['aim'][0] < W and 0 <= last['aim'][1] < H:
             cv2.drawMarker(disp, last['aim'], (0, 0, 255), cv2.MARKER_CROSS, 70, 6)
-        cv2.putText(disp, f"ref {refs[idx]['name']} ({idx+1}/{len(refs)})  cov={cov:.2f} uniq={last['uniq']}",
+        cv2.putText(disp, f"ref {refs[idx]['name']} ({idx+1}/{len(refs)})  occ={cov:.2f} uniq={last['uniq']}",
                     (15, 42), cv2.FONT_HERSHEY_SIMPLEX, 1.1, col, 2)
         cw.writerow([n, idx, refs[idx]['name'], f"{last['cov']:.3f}", last['uniq'],
                      last['aim'][0] if last['aim'] else -1, last['aim'][1] if last['aim'] else -1])

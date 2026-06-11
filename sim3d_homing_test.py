@@ -2,7 +2,7 @@
 """sim3d_homing_test.py — 场景级视觉归航:参考图=整张照片(不裁剪),覆盖率驱动切换。
 参考图序列 = 沿接近路径在 [20,14,10,7,5,3.5,2.5]m 拍的整帧(广角)。
 实时:当前画面 vs 当前参考图整图 SIFT 匹配 → 算"画面覆盖参考图的比例";
-覆盖 < 50% → 切下一张(更近拍的)。每次成功匹配/切换输出 参考图|当前画面 对比图。"""
+参考图占画面 >50% → 切下一张(更近拍的)。每次成功匹配/切换输出 参考图|当前画面 对比图。"""
 import cv2, numpy as np, os, shutil, time
 from sim3d_scene import build_world, render_view
 
@@ -49,11 +49,11 @@ def match_ref(frame_kp, frame_des, ref):
     return Hm, uniq
 
 
-def coverage(Hm):
-    """当前画面覆盖参考图的面积比例:画面四角 → (H⁻¹) → 参考图坐标,与参考图矩形求交"""
-    Hinv = np.linalg.inv(Hm)
+def occupancy(Hm):
+    """参考图占当前画面的面积比例:参考图四角 → (H) → 画面坐标,与画面矩形求交。
+    几何 = (拍摄距离/当前距离)²;>50% = 已逼近到拍摄距离 1.41 倍 → 该换下一张路标"""
     corners = np.float32([[0, 0], [W, 0], [W, H], [0, H]]).reshape(-1, 1, 2)
-    foot = cv2.perspectiveTransform(corners, Hinv).reshape(-1, 2)
+    foot = cv2.perspectiveTransform(corners, Hm).reshape(-1, 2)
     rect = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
     area, _ = cv2.intersectConvexConvex(foot.astype(np.float32), rect)
     return area / (W * H)
@@ -67,7 +67,7 @@ def save_switch(tag, n, ref, frame, cov, uniq, aim):
     if aim is not None:
         cv2.drawMarker(fr, aim, (0, 0, 255), cv2.MARKER_CROSS, 60, 6)
     fr = cv2.resize(fr, (int(W * Hc / H), Hc))
-    cv2.putText(fr, f"{tag} f{n} cov={cov:.2f} uniq={uniq}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    cv2.putText(fr, f"{tag} f{n} occ={cov:.2f} uniq={uniq}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
     sep = np.full((Hc, 6, 3), 255, np.uint8)
     cv2.imwrite(os.path.join(OUT, 'switches', f"{n:04d}_{tag}_{ref['dist']}m.jpg"), np.hstack([r, sep, fr]))
 
@@ -88,32 +88,33 @@ for n in range(N):
     cov = 0.0; aim = None; uniq = 0
     if m is not None:
         Hm, uniq = m
-        cov = coverage(Hm)
-        # 瞄准点 = 参考图中心在当前画面的投影(归航方向)
+        cov = occupancy(Hm)
+        # 瞄准点 = 前方路标(当前参考图)中心在画面的投影
         c = cv2.perspectiveTransform(np.float32([[[W / 2, H / 2]]]), Hm).reshape(2)
         aim = (int(c[0]), int(c[1]))
         if not acquired:
             acquired = True
             save_switch('ACQUIRE', n, ref, frame, cov, uniq, aim)
             events.append((n, 'ACQUIRE', ref['dist'], d, cov))
-            print(f"[ACQUIRE] f{n} dist={d:.1f}m ref@{ref['dist']}m cov={cov:.2f} uniq={uniq}")
+            print(f"[ACQUIRE] f{n} dist={d:.1f}m ref@{ref['dist']}m occ={cov:.2f} uniq={uniq}")
         else:
-            low_cov_cnt = low_cov_cnt + 1 if cov < 0.5 else 0
+            # 你的规则: 参考图占画面 >50%(快走到这张路标了)→ 切下一张更近的
+            low_cov_cnt = low_cov_cnt + 1 if cov > 0.5 else 0
             if low_cov_cnt >= 3 and idx < len(refs) - 1:
-                # 防御②: 切换前验证下一张(匹配成功 + 覆盖在合理区间),否则保持现状
+                # 切换前验证下一张路标可见(占比在合理小区间),否则保持
                 ref2 = refs[idx + 1]
                 m2 = match_ref(fkp, fdes, ref2)
-                cov2 = coverage(m2[0]) if m2 else -1
-                if m2 is not None and 0.5 <= cov2 <= 1.05:
+                cov2 = occupancy(m2[0]) if m2 else -1
+                if m2 is not None and 0.10 <= cov2 <= 0.60:
                     idx += 1; low_cov_cnt = 0
                     save_switch('SWITCH', n, ref2, frame, cov2, m2[1], aim)
                     events.append((n, 'SWITCH', ref2['dist'], d, cov2))
-                    print(f"[SWITCH] f{n} dist={d:.1f}m → ref@{ref2['dist']}m (旧cov={cov:.2f} 新cov={cov2:.2f})")
+                    print(f"[SWITCH] f{n} dist={d:.1f}m → ref@{ref2['dist']}m (旧occ={cov:.2f} 新occ={cov2:.2f})")
     disp = frame.copy()
     if aim:
         cv2.drawMarker(disp, aim, (0, 0, 255), cv2.MARKER_CROSS, 60, 6)
     col = (0, 255, 0) if m else (0, 0, 255)
-    cv2.putText(disp, f"f{n} dist={d:.1f}m ref@{refs[idx]['dist']}m cov={cov:.2f}", (15, 40),
+    cv2.putText(disp, f"f{n} dist={d:.1f}m ref@{refs[idx]['dist']}m occ={cov:.2f}", (15, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.1, col, 2)
     vw.write(cv2.resize(disp, (W // 2, H // 2)))
 vw.release()
