@@ -112,80 +112,99 @@ if not args.no_display:
     cv2.namedWindow('LiveHoming', cv2.WINDOW_NORMAL); cv2.resizeWindow('LiveHoming', 1280, 720)
 
 FRAME_BYTES = W * H * 3
-stop = False
-while not stop:
-    for ip in my_ips():
-        print(f"[RTMP] 等待推流: DJI Fly → 直播 → rtmp://{ip}:{args.port}/live")
-    proc = subprocess.Popen(
-        ['ffmpeg', '-loglevel', 'error', '-listen', '1',
-         '-i', f'rtmp://0.0.0.0:{args.port}/live',
-         '-an', '-vf', f'scale={W}:{H}', '-pix_fmt', 'bgr24', '-f', 'rawvideo', '-'],
-        stdout=subprocess.PIPE, bufsize=FRAME_BYTES * 4)
+for ip in my_ips():
+    print(f"[RTMP] 等待推流: DJI Fly → 直播 → rtmp://{ip}:{args.port}/live")
+proc = subprocess.Popen(
+    ['ffmpeg', '-loglevel', 'error', '-fflags', 'nobuffer', '-flags', 'low_delay',
+     '-listen', '1', '-i', f'rtmp://0.0.0.0:{args.port}/live',
+     '-an', '-vf', f'scale={W}:{H}', '-pix_fmt', 'bgr24', '-f', 'rawvideo', '-'],
+    stdout=subprocess.PIPE, bufsize=FRAME_BYTES)
+
+# 独立线程读流 → latest(主循环不阻塞在 read;流抖动时 GUI 仍流畅显示最新帧)
+latest = [None]; latest_id = [0]; lk = threading.Lock(); alive = [True]
+def reader():
     buf = b''
-    while True:
+    while alive[0]:
         chunk = proc.stdout.read(FRAME_BYTES - len(buf))
         if not chunk:
-            print("[RTMP] 流断开")
             break
         buf += chunk
-        if len(buf) < FRAME_BYTES:
-            continue
-        frame = np.frombuffer(buf, np.uint8).reshape(H, W, 3).copy()
-        buf = b''
-        if t_start is None:
-            t_start = time.time()
-            print("[RTMP] ✓ 收到画面,归航开始")
-        # 异步分析
-        if fut is None:
-            fut_frame = frame
-            fut = ex.submit(analyze, frame, idx)
-        elif fut.done():
-            try:
-                last = fut.result()
-            except Exception:
-                last = None
-            fut = None
-            if last and last['idx'] == idx:
-                high_cnt = high_cnt + 1 if last['occ'] > 0.5 else (0 if last['occ'] >= 0 else high_cnt)
-                if high_cnt >= 3 and last['next_ok'] and idx < len(refs) - 1:
-                    idx += 1; high_cnt = 0
-                    r = refs[idx]
-                    th = cv2.resize(r['img'], (480, int(480 * r['h'] / r['w'])))
-                    fr = cv2.resize(fut_frame, (480, 270))
-                    pad = max(th.shape[0], 270)
-                    cmb = np.zeros((pad, 966, 3), np.uint8)
-                    cmb[:th.shape[0], :480] = th; cmb[:270, 486:966] = fr
-                    cv2.imwrite(os.path.join(OUT, 'switches', f'{n:06d}_to_{r["name"]}.jpg'), cmb)
-                    print(f"[SWITCH] f{n} → {r['name']} (occ={last['next_occ']:.2f})")
-        disp = frame
-        if last:
-            if last['aim'] and 0 <= last['aim'][0] < W and 0 <= last['aim'][1] < H:
-                cv2.drawMarker(disp, last['aim'], (0, 0, 255), cv2.MARKER_CROSS, 60, 5)
-            col = (0, 255, 0) if last['occ'] >= 0 else (0, 0, 255)
-            txt = f"ref {refs[idx]['name']} ({idx+1}/{len(refs)}) occ={last['occ']:.2f} uniq={last['uniq']}" \
-                if last['occ'] >= 0 else f"ref {refs[idx]['name']} ({idx+1}/{len(refs)}) NO MATCH"
-            cv2.putText(disp, txt, (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
-            cw.writerow([n, idx, refs[idx]['name'], f"{last['occ']:.3f}", last['uniq'],
-                         last['aim'][0] if last['aim'] else -1, last['aim'][1] if last['aim'] else -1])
-        cv2.putText(disp, f"f{n} {fps_now:.0f}fps LIVE", (12, H - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        try:
-            rec_q.put_nowait(disp.copy())
-        except queue.Full:
-            pass
-        if not args.no_display:
-            cv2.imshow('LiveHoming', disp)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                stop = True
-                break
-        n += 1
-        if n % 30 == 0:
-            now = time.perf_counter(); fps_now = 30 / (now - t0); t0 = now
-        if args.max_sec and t_start and time.time() - t_start > args.max_sec:
-            stop = True
+        if len(buf) >= FRAME_BYTES:
+            fr = np.frombuffer(buf[:FRAME_BYTES], np.uint8).reshape(H, W, 3).copy()
+            buf = buf[FRAME_BYTES:]
+            with lk:
+                latest[0] = fr; latest_id[0] += 1
+    alive[0] = False
+threading.Thread(target=reader, daemon=True).start()
+
+stop = False; seen_id = -1
+while not stop:
+    with lk:
+        if latest_id[0] != seen_id and latest[0] is not None:
+            frame = latest[0].copy(); seen_id = latest_id[0]
+        else:
+            frame = None
+    if frame is None:                      # 无新帧:保活窗口,不阻塞
+        if not alive[0]:
+            print("[RTMP] 流断开/未收到画面")
             break
-    proc.kill()
-    if args.once:
-        break
+        if not args.no_display:
+            if cv2.waitKey(15) & 0xFF == ord('q'):
+                break
+        else:
+            time.sleep(0.005)
+        continue
+    if t_start is None:
+        t_start = time.time()
+        print("[RTMP] ✓ 收到画面,归航开始")
+    # 异步分析
+    if fut is None:
+        fut_frame = frame
+        fut = ex.submit(analyze, frame, idx)
+    elif fut.done():
+        try:
+            last = fut.result()
+        except Exception:
+            last = None
+        fut = None
+        if last and last['idx'] == idx:
+            high_cnt = high_cnt + 1 if last['occ'] > 0.5 else (0 if last['occ'] >= 0 else high_cnt)
+            if high_cnt >= 3 and last['next_ok'] and idx < len(refs) - 1:
+                idx += 1; high_cnt = 0
+                r = refs[idx]
+                th = cv2.resize(r['img'], (480, int(480 * r['h'] / r['w'])))
+                fr = cv2.resize(fut_frame, (480, 270))
+                pad = max(th.shape[0], 270)
+                cmb = np.zeros((pad, 966, 3), np.uint8)
+                cmb[:th.shape[0], :480] = th; cmb[:270, 486:966] = fr
+                cv2.imwrite(os.path.join(OUT, 'switches', f'{n:06d}_to_{r["name"]}.jpg'), cmb)
+                print(f"[SWITCH] f{n} → {r['name']} (occ={last['next_occ']:.2f})")
+    disp = frame
+    if last:
+        if last['aim'] and 0 <= last['aim'][0] < W and 0 <= last['aim'][1] < H:
+            cv2.drawMarker(disp, last['aim'], (0, 0, 255), cv2.MARKER_CROSS, 60, 5)
+        col = (0, 255, 0) if last['occ'] >= 0 else (0, 0, 255)
+        txt = f"ref {refs[idx]['name']} ({idx+1}/{len(refs)}) occ={last['occ']:.2f} uniq={last['uniq']}" \
+            if last['occ'] >= 0 else f"ref {refs[idx]['name']} ({idx+1}/{len(refs)}) NO MATCH"
+        cv2.putText(disp, txt, (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
+        cw.writerow([n, idx, refs[idx]['name'], f"{last['occ']:.3f}", last['uniq'],
+                     last['aim'][0] if last['aim'] else -1, last['aim'][1] if last['aim'] else -1])
+    cv2.putText(disp, f"f{n} {fps_now:.0f}fps LIVE", (12, H - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    try:
+        rec_q.put_nowait(disp.copy())
+    except queue.Full:
+        pass
+    if not args.no_display:
+        cv2.imshow('LiveHoming', disp)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            stop = True
+    n += 1
+    if n % 30 == 0:
+        now = time.perf_counter(); fps_now = 30 / (now - t0); t0 = now
+    if args.max_sec and t_start and time.time() - t_start > args.max_sec:
+        stop = True
+alive[0] = False
+proc.kill()
 
 rec_q.put(None); time.sleep(0.4)
 if _wr[0] is not None:
